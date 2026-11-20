@@ -1,0 +1,7 @@
+interface:
+  display_name: "seedance2.5提示词设计-v1.0"
+  short_description: "编写并接续精修视频提示词，按剧情设计走位与表演，多轮改稿保持精练"
+  default_prompt: "使用 $seedance25-prompt-design-v1-0 编写或续改这份 Seedance 2.5 提示词，沿用已定分镜，用导演讲戏的短句定位画内元素，写出有真人感的表演和有来去的动作，合并重复指令。"
+
+policy:
+  allow_implicit_invocation: true
