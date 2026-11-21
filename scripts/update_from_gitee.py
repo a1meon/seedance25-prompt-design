@@ -85,8 +85,37 @@ def exchange(installed, staged):
         raise OSError(code, os.strerror(code))
 
 
+def repository_path(url):
+    return re.sub(r"\.git$", "", url.replace("git@gitee.com:", "https://gitee.com/"))
+
+
+def update_checkout(root, remote, ref, revision):
+    origin = git("remote", "get-url", "origin", cwd=root).decode().strip()
+    if repository_path(origin) != repository_path(remote):
+        raise ValueError("安装副本的 origin 与技能更新源不一致")
+    branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=root).decode().strip()
+    if "refs/heads/" + branch != ref:
+        raise ValueError("请从技能配置的分支更新此安装副本")
+    if git("status", "--porcelain", "--untracked-files=normal", cwd=root):
+        raise ValueError("安装副本有本地改动，请先处理这些改动再更新")
+    head = git("rev-parse", "HEAD", cwd=root).decode().strip()
+    if head == revision:
+        return "current"
+    git("fetch", "--quiet", "--no-tags", "origin", ref, cwd=root)
+    fetched = git("rev-parse", "--verify", "FETCH_HEAD^{commit}", cwd=root).decode().strip()
+    try:
+        git("merge-base", "--is-ancestor", head, fetched, cwd=root)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            raise ValueError("安装副本有独立提交，无法快进到 Gitee 版本") from error
+        raise
+    git("merge", "--ff-only", "--no-overwrite-ignore", fetched, cwd=root)
+    return "updated"
+
+
 def update(root):
-    if root.name != NAME or (root / ".git").exists():
+    checkout = (root / ".git").exists()
+    if root.name != NAME or (checkout and (root.parent.name != "skills" or not (root / ".git").is_dir())):
         raise ValueError("请从此技能的安装目录执行更新")
     # Stage outside the skills discovery directory. A subsequent caller cleans
     # up a previous interrupted download or the old snapshot after a swap.
@@ -102,6 +131,8 @@ def update(root):
         revision, actual_ref = line.split("\t")
         if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
             raise ValueError("远端分支返回了无效的提交标识")
+        if checkout:
+            return update_checkout(root, remote, ref, revision)
         marker = root / REVISION
         if marker.exists() and marker.read_text().strip() == revision:
             return "current"
