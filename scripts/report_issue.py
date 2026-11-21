@@ -65,6 +65,11 @@ def normalized_title(title):
     return " ".join(title.split()).casefold()
 
 
+def web_submission_help(page):
+    return (f"可通过网页提交。首次使用可在 https://gitee.com/signup 注册，"
+            f"已有账号可在 https://gitee.com/login 登录，再打开 {page}。\n")
+
+
 def has_file_link(line):
     for url in re.findall(r"https://[^\s)<>]+", line):
         parts = urlsplit(url)
@@ -148,9 +153,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="查看已开及已关闭的 Issue")
-    create = commands.add_parser("create", help="提交完整案例，同标题时向原 Issue 补充新案例")
+    create = commands.add_parser("create", help="新建有调优价值的案例，同标题只返回原 Issue 链接")
     create.add_argument("--title", required=True)
-    extra = commands.add_parser("supplement", help="向已定位的同类 Issue 补充完整案例")
+    extra = commands.add_parser("supplement", help="向已有 Issue 提交能帮助定位问题或验证修复的新证据")
     extra.add_argument("--issue", required=True, help="原 Issue 编号")
     check = commands.add_parser("check", help="在本地检查完整材料报告的栏目和附件链接格式")
     for command in (create, extra, check):
@@ -162,6 +167,19 @@ def main():
             print(issue_url(issue), issue["state"], issue["title"])
         return
 
+    if args.command == "create":
+        title = args.title.strip()
+        if not title:
+            parser.error("标题需要有内容")
+        try:
+            for issue in list_issues(token):
+                if normalized_title(issue["title"]) == normalized_title(title):
+                    print("existing", issue_url(issue))
+                    return
+        except HTTPError as error:
+            if not token and error.code in (401, 403):
+                parser.exit(1, web_submission_help(ISSUES))
+            raise
     try:
         body = read_case(args.body_file)
     except ValueError as error:
@@ -170,19 +188,13 @@ def main():
         print("四项栏目与附件链接格式通过")
         return
     if not token:
-        parser.exit(1, "提交需要 GITEE_ACCESS_TOKEN，或使用已登录的 Gitee 工具。\n")
+        page = issue_url({"number": args.issue}) if args.command == "supplement" else ISSUES
+        parser.exit(1, web_submission_help(page))
 
     try:
         if args.command == "supplement":
             supplement(args.issue, body, token)
             return
-        title = args.title.strip()
-        if not title:
-            parser.error("标题需要有内容")
-        for issue in list_issues(token):
-            if normalized_title(issue["title"]) == normalized_title(title):
-                supplement(issue["number"], body, token)
-                return
         result = gitee("/issues", token, {"repo": REPO, "title": title, "body": body})
         url = issue_url(result)
     except (HTTPException, OSError, ValueError, KeyError, TypeError) as error:

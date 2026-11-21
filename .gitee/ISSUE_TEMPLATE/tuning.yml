@@ -5,7 +5,7 @@ body:
     id: problem
     attributes:
       label: 问题简述
-      description: 哪一镜或哪一步出现了什么问题？用一两句写明预期与实际表现，有技能提交号时也可附上。
+      description: 哪一镜或哪一步与你预期不同？简述实际表现，以及这个案例可以帮助维护者检查什么。Agent 可以帮你整理。
     validations:
       required: true
   - type: textarea
