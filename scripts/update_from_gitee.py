@@ -1,15 +1,20 @@
 """Check the configured Gitee branch and replace the installed skill in place."""
+import argparse
 import ctypes
-import fcntl
+import errno
 import io
 import json
+import ntpath
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 
 NAME = "seedance25-prompt-design-v1-0"
 SOURCE = "gitee-source.json"
@@ -26,7 +31,7 @@ def git(*args, cwd=None):
 
 
 def read_source(root):
-    config = json.loads((root / SOURCE).read_text())
+    config = json.loads((root / SOURCE).read_text(encoding="utf-8-sig"))
     remote = config["repository"]
     if not isinstance(remote, str) or not re.fullmatch(
         r"(?:https://gitee\.com/|git@gitee\.com:)[\w.-]+/[\w.-]+", remote
@@ -49,6 +54,12 @@ def export_skill(repo, revision, subdir, destination):
             path = PurePosixPath(member.name)
             if path.is_absolute() or ".." in path.parts or ".git" in path.parts or path.name == REVISION:
                 raise ValueError("更新包路径无效")
+            if sys.platform == "win32" and any(
+                re.search(r'[<>:"\\|?*\x00-\x1f]', part) or part.endswith((" ", "."))
+                or windows_reserved(part) or part.lower() in (".git", REVISION)
+                for part in path.parts
+            ):
+                raise ValueError("更新包路径与 Windows 不兼容")
             target = destination / path
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
@@ -59,7 +70,7 @@ def export_skill(repo, revision, subdir, destination):
                 target.chmod(0o755 if member.mode & 0o111 else 0o644)
             else:
                 raise ValueError("更新包包含非普通文件")
-    skill = (destination / "SKILL.md").read_text()
+    skill = (destination / "SKILL.md").read_text(encoding="utf-8")
     front = re.match(r"\A---\n(.*?)\n---\n", skill, re.S)
     if not front or f"name: {NAME}" not in front[1].splitlines():
         raise ValueError("更新包的技能标识不匹配")
@@ -68,6 +79,12 @@ def export_skill(repo, revision, subdir, destination):
     for ref in re.findall(r"\]\((references/[^)#]+)(?:#[^)]*)?\)", skill):
         if not (destination / ref).is_file():
             raise ValueError("更新包缺少 " + ref)
+
+
+def windows_reserved(part):
+    if hasattr(ntpath, "isreserved"):
+        return ntpath.isreserved(part)
+    return PureWindowsPath(part).is_reserved()  # Python 3.8–3.12
 
 
 def exchange(installed, staged):
@@ -83,6 +100,99 @@ def exchange(installed, staged):
     if result:
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code))
+
+
+def lock_update(lock):
+    if os.name != "nt":
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return
+
+    import msvcrt
+    lock.seek(0)
+    deadline = time.monotonic() + 180
+    while True:
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            return  # Closing the file releases the byte-range lock.
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError("另一更新进程仍持有安装锁") from error
+            time.sleep(0.25)
+
+
+def retry_readonly(func, path, exc_info):
+    # Git for Windows can leave read-only pack files in the temporary bare repo.
+    if (os.name != "nt" or func not in (os.unlink, os.remove, os.rmdir)
+            or not os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY):
+        raise exc_info[1]
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def discard(path):
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path, onerror=retry_readonly)
+    else:
+        try:
+            path.unlink()
+        except PermissionError:
+            retry_readonly(os.unlink, path, sys.exc_info())
+
+
+def install_file(source, target):
+    if target.is_file() and target.read_bytes() == source.read_bytes():
+        return
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as output:
+        temporary = Path(output.name)
+    try:
+        shutil.copyfile(source, temporary)
+        if os.name == "nt" and target.exists():
+            if target.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+                target.chmod(stat.S_IWRITE)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def sync_windows_tree(source, target):
+    # Keep the live root, especially SKILL.md and the updater, addressable.
+    for item in source.iterdir():
+        if item.name == REVISION:
+            continue
+        dest = target / item.name
+        if dest.exists() or dest.is_symlink():
+            attrs = getattr(dest.lstat(), "st_file_attributes", 0)
+            if dest.is_symlink() or attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ValueError(f"安装路径包含重解析点或符号链接：{dest}")
+            if dest.is_dir() != item.is_dir():
+                discard(dest)
+        if item.is_dir():
+            dest.mkdir(exist_ok=True)
+            sync_windows_tree(item, dest)
+        else:
+            install_file(item, dest)
+    for dest in target.iterdir():
+        if not (source / dest.name).exists():
+            discard(dest)
+
+
+def finish_windows_update(root, pending, consumed):
+    if (root / ".git").exists():
+        raise ValueError("不能把待完成的安装包写入 Git 检出目录")
+    marker = root / REVISION
+    if marker.exists():
+        discard(marker)
+    sync_windows_tree(pending, root)
+    install_file(pending / REVISION, marker)
+    # Retire the whole journal before cleanup, so a crash while removing it
+    # cannot turn a half-deleted staging tree into the next recovery source.
+    pending.rename(consumed)
 
 
 def repository_path(url):
@@ -121,21 +231,31 @@ def update(root):
     # up a previous interrupted download or the old snapshot after a swap.
     cache = root.parent.parent / ("." + root.parent.name + "-" + NAME + "-sync")
     cache.mkdir(mode=0o700, exist_ok=True)
-    with (cache / "lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with (cache / "lock").open("a+b") as lock:
+        lock_update(lock)
         work = cache / "transaction"
         if work.exists():
-            shutil.rmtree(work)
+            discard(work)
+        pending = cache / "pending"
+        resumed = pending.exists()
+        if resumed:
+            finish_windows_update(root, pending, work)
+            discard(work)
         remote, ref, subdir = read_source(root)
-        line = git("ls-remote", "--exit-code", "--refs", remote, ref).decode().strip()
+        try:
+            line = git("ls-remote", "--exit-code", "--refs", remote, ref).decode().strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            if resumed:
+                raise OSError("上次中断的更新已在本地完成，本次查询 Gitee 版本失败") from error
+            raise
         revision, actual_ref = line.split("\t")
         if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
             raise ValueError("远端分支返回了无效的提交标识")
         if checkout:
             return update_checkout(root, remote, ref, revision)
         marker = root / REVISION
-        if marker.exists() and marker.read_text().strip() == revision:
-            return "current"
+        if marker.exists() and marker.read_text(encoding="ascii").strip() == revision:
+            return "updated" if resumed else "current"
         work.mkdir(mode=0o700)
         try:
             repo = work / "repo"
@@ -146,16 +266,24 @@ def update(root):
             export_skill(repo, fetched, subdir, staged)
             if read_source(staged) != (remote, ref, subdir):
                 raise ValueError("更新包的来源与当前配置不一致")
-            (staged / REVISION).write_text(fetched + "\n")
-            exchange(root, staged)
+            (staged / REVISION).write_text(fetched + "\n", encoding="ascii")
+            if sys.platform == "win32":
+                staged.rename(pending)
+                finish_windows_update(root, pending, staged)
+            else:
+                exchange(root, staged)
         finally:
-            shutil.rmtree(work)
+            discard(work)
         return "updated"
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--install-dir", type=Path, default=Path(__file__).resolve().parents[1],
+                        help="已有技能安装目录，可用新版更新器引导旧版完成首次升级")
+    args = parser.parse_args()
     try:
-        print(update(Path(__file__).resolve().parents[1]))
+        print(update(args.install_dir.resolve(strict=True)))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as error:
         if isinstance(error, subprocess.CalledProcessError):
             message = f"Git 命令 {error.cmd[3]} 失败，退出码 {error.returncode}，请检查网络、分支与仓库访问权限"
