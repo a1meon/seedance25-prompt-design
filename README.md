@@ -14,4 +14,4 @@
 
 ## 使用反馈
 
-安装、更新、写提示词或看完成片时都可以直接告诉 Agent 遇到了什么。能定位到技能的问题，Agent 会先查已有 Issue，在获得本次或持续授权后，用去除项目素材的最小例子提交。授权必要时自动反馈后，后续同范围的问题可以直接处理。支持已连接的 Gitee 工具、已登录的仓库页面，也支持给内置脚本配置 `GITEE_ACCESS_TOKEN`。[仓库 Issues](https://gitee.com/a1meon_admin/seedance25_prompt/issues)
+安装、更新、写提示词或看完成片时都可以告诉 Agent 哪里出了问题。用于调优的 Issue 会带上问题简述、当时的完整提示词、当次输入的完整剧本，以及每个实际使用的图片、音频、视频等参考素材原件，并保留 `@编号 → 用途` 的对应关系。材料可放在 Issue 正文、附件或维护者能打开的原文件链接中。已有同类 Issue 时，新案例补在原帖下。提交依据使用者对这些完整材料的本次或持续授权。[仓库 Issues](https://gitee.com/a1meon_admin/seedance25_prompt/issues)

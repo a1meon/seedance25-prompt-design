@@ -1,0 +1,31 @@
+name: 提交技能调优案例
+description: 用出现问题时的提示词、剧本和参考素材复核实际表现
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题简述
+      description: 哪一镜或哪一步出现了什么问题？用一两句写明预期与实际表现，有技能提交号时也可附上。
+    validations:
+      required: true
+  - type: textarea
+    id: prompt
+    attributes:
+      label: 完整提示词
+      description: 粘贴当时实际使用的提示词全文，或附可读取全文的原文件。安装阶段尚未生成提示词时请注明。
+    validations:
+      required: true
+  - type: textarea
+    id: script
+    attributes:
+      label: 完整剧本
+      description: 粘贴当次输入的全部剧本或附原剧本文件。此次没有输入剧本时请注明。
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: 参考素材
+      description: 逐项附上全部实际素材的原件或维护者可访问的原文件链接，写明各自的编号和用途。使用同一压缩包时列出包内对应文件。未使用参考素材或仅预留编号时请注明。
+    validations:
+      required: true
