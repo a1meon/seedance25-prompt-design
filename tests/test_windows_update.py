@@ -1,5 +1,6 @@
 """Offline regression tests. On Windows run: py -3 -B -m unittest discover -s tests"""
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -7,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
@@ -26,6 +28,7 @@ class WindowsSnapshotTests(unittest.TestCase):
         self.root.mkdir(parents=True)
         self.remote.mkdir()
         config = base / "gitconfig"
+        self.config = config
         env = patch.dict(os.environ, {
             "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_ALLOW_PROTOCOL": "file", "GIT_TERMINAL_PROMPT": "0",
@@ -40,6 +43,9 @@ class WindowsSnapshotTests(unittest.TestCase):
         (self.remote / "scripts").mkdir()
         for name in ("gitee-source.json", "scripts/update_from_gitee.py"):
             shutil.copyfile(PACKAGE / name, self.remote / name)
+        if updater.read_source(self.remote).github:
+            self.git("config", "--file", str(config), "--add", "url." + self.remote.as_uri() + ".insteadOf",
+                     updater.read_source(self.remote).github)
         self.write_skill("旧版")
         (self.remote / "obsolete.txt").write_bytes(b"old")
         self.commit()
@@ -101,6 +107,103 @@ class WindowsSnapshotTests(unittest.TestCase):
         self.assertEqual(subprocess.check_output([sys.executable, str(installed_script)],
                                                  cwd=self.root).strip(), b"current")
         self.assert_updated()
+
+    def prepare_bridge(self):
+        self.github_url = "https://github.com/fixture-owner/skill.git"
+        self.github = self.remote.parent / "github"
+        self.legacy = updater.read_source(self.root).legacy
+        # Start with a real pre-migration configuration, then add one optional
+        # field in the Gitee release. The two remotes continue on common history.
+        config = json.loads((self.root / updater.SOURCE).read_text(encoding="utf-8"))
+        config.pop("github_repository", None)
+        (self.root / updater.SOURCE).write_text(json.dumps(config), encoding="utf-8")
+        config["github_repository"] = self.github_url
+        (self.remote / updater.SOURCE).write_text(json.dumps(config), encoding="utf-8")
+        self.commit()
+        self.bridge = self.git("rev-parse", "HEAD").decode().strip()
+        self.git("clone", "--no-local", "--quiet", str(self.remote), str(self.github))
+        self.git("config", "--file", str(self.config), "url." + self.github.as_uri() + ".insteadOf",
+                 self.github_url)
+        (self.github / "github-only.md").write_text("release", encoding="utf-8")
+        self.git("-C", str(self.github), "add", "github-only.md")
+        self.git("-C", str(self.github), "-c", "user.name=Test", "-c", "user.email=test@localhost",
+                 "-c", "commit.gpgSign=false", "commit", "--quiet", "-m", "GitHub release")
+
+    def test_gitee_bridge_moves_single_install_to_github(self):
+        self.prepare_bridge()
+        self.assertEqual(updater.update(self.root), "updated")
+        self.assertEqual((self.root / updater.REVISION).read_text().strip(), self.bridge)
+        self.remote.rename(self.remote.with_name("unavailable-gitee"))
+        self.assertEqual(updater.update(self.root), "updated")
+        self.assertTrue((self.root / "github-only.md").is_file())
+        self.assertEqual(updater.update(self.root), "current")
+        self.assertEqual(list(self.root.parent.iterdir()), [self.root])
+
+    def test_gitee_checkout_fast_forwards_from_github_and_protects_edits(self):
+        self.prepare_bridge()
+        clone = self.remote.parent / "git-install" / "skills" / updater.NAME
+        clone.parent.mkdir(parents=True)
+        self.git("clone", "--quiet", self.legacy, str(clone))
+        self.remote.rename(self.remote.with_name("unavailable-gitee"))
+        (clone / "user-edit.md").write_text("keep")
+        with self.assertRaisesRegex(ValueError, "本地改动"):
+            updater.update(clone)
+        (clone / "user-edit.md").unlink()
+        self.assertEqual(updater.update(clone), "updated")
+        self.assertTrue((clone / "github-only.md").is_file())
+        self.assertEqual(updater.update(clone), "current")
+
+    def test_external_helper_can_rescue_legacy_install_without_gitee(self):
+        self.prepare_bridge()
+        self.remote.rename(self.remote.with_name("unavailable-gitee"))
+        self.assertEqual(updater.update(self.root, self.github), "updated")
+        self.assertTrue((self.root / "github-only.md").is_file())
+
+    def test_unreachable_primary_keeps_installed_version_without_downgrade(self):
+        self.prepare_bridge()
+        self.assertEqual(updater.update(self.root), "updated")
+        self.assertEqual(updater.update(self.root), "updated")
+        self.github.rename(self.github.with_name("unavailable-github"))
+        before = (self.root / updater.REVISION).read_bytes()
+        self.assertEqual(updater.update(self.root), "offline")
+        self.assertEqual((self.root / updater.REVISION).read_bytes(), before)
+        self.assertTrue((self.root / "github-only.md").is_file())
+        (self.root / "SKILL.md").unlink()
+        with self.assertRaises(FileNotFoundError):
+            updater.update(self.root)
+
+    def test_interrupted_download_keeps_previous_install(self):
+        before = (self.root / updater.REVISION).read_bytes()
+        with patch.object(updater, "remote_git", side_effect=[
+            (self.tip + "\trefs/heads/main").encode(), updater.RemoteUnavailable()
+        ]):
+            self.assertEqual(updater.update(self.root), "offline")
+        self.assertEqual((self.root / updater.REVISION).read_bytes(), before)
+        self.assertTrue((self.root / "obsolete.txt").is_file())
+
+    def test_transport_deadline(self):
+        start = time.monotonic()
+        with self.assertRaises(updater.RemoteUnavailable):
+            updater.remote_git("-c", "alias.stall=!sleep 15", "stall", cwd=self.remote, timeout=1)
+        self.assertLess(time.monotonic() - start, 6)
+
+    def test_readonly_sandbox_checks_without_installing(self):
+        with patch.object(Path, "mkdir", side_effect=PermissionError):
+            self.assertEqual(updater.update(self.root), "needs-write")
+            self.assertTrue((self.root / "obsolete.txt").is_file())
+        self.assertEqual(updater.update(self.root), "updated")
+        with patch.object(Path, "mkdir", side_effect=PermissionError):
+            self.assertEqual(updater.update(self.root), "current")
+            self.remote.rename(self.remote.with_name("unavailable"))
+            self.assertEqual(updater.update(self.root), "offline")
+
+    @unittest.skipIf(os.name == "nt", "uses POSIX snapshot exchange")
+    def test_concurrent_snapshot_check_returns_immediately(self):
+        cache = self.root.parent.parent / ("." + self.root.parent.name + "-" + updater.NAME + "-sync")
+        cache.mkdir()
+        with (cache / "lock").open("a+b") as lock:
+            updater.lock_update(lock)
+            self.assertEqual(updater.update(self.root), "busy")
 
     @unittest.skipUnless(os.name == "nt", "requires Windows file sharing and read-only attributes")
     def test_busy_entrypoint_and_readonly_obsolete_file(self):
