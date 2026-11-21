@@ -45,7 +45,7 @@ def print_matches(query, entries, limit):
     for family, word, _, direct, close, wide in hits[:limit]:
         print(f"{family} / {word}\n面部或声音演法：{direct}，{close}。\n身体演法（{word}）：{wide}。\n")
     if not hits:
-        print("未命中。保留原情绪词，按景别补一个可见或可听的表现，也可换近义词检索。")
+        print("未命中。按剧本找这一拍的触发、人物想做的事和可见反应。遇到抽象演技评语，查 references/script-to-performance.md 的「把抽象评语落实到当下的戏」。")
 
 
 def emotion_parts(query):
