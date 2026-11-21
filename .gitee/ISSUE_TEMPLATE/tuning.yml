@@ -5,7 +5,7 @@ body:
     id: problem
     attributes:
       label: 问题简述
-      description: 哪一镜或哪一步与你预期不同？简述实际表现，以及这个案例可以帮助维护者检查什么。Agent 可以帮你整理。
+      description: 哪一镜或哪一步与你预期不同？例如哪位角色应该在哪个字之后才有反应，提示词或成片里又是怎样演的。用自己的话说即可，Agent 可以帮你整理。
     validations:
       required: true
   - type: textarea
