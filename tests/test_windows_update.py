@@ -165,7 +165,7 @@ class WindowsSnapshotTests(unittest.TestCase):
         self.assertEqual(updater.update(self.root), "updated")
         self.github.rename(self.github.with_name("unavailable-github"))
         before = (self.root / updater.REVISION).read_bytes()
-        self.assertEqual(updater.update(self.root), "offline")
+        self.assertEqual(updater.update(self.root), "retained")
         self.assertEqual((self.root / updater.REVISION).read_bytes(), before)
         self.assertTrue((self.root / "github-only.md").is_file())
         (self.root / "SKILL.md").unlink()
@@ -177,7 +177,7 @@ class WindowsSnapshotTests(unittest.TestCase):
         with patch.object(updater, "remote_git", side_effect=[
             (self.tip + "\trefs/heads/main").encode(), updater.RemoteUnavailable()
         ]):
-            self.assertEqual(updater.update(self.root), "offline")
+            self.assertEqual(updater.update(self.root, preference="gitee"), "offline")
         self.assertEqual((self.root / updater.REVISION).read_bytes(), before)
         self.assertTrue((self.root / "obsolete.txt").is_file())
 
@@ -188,14 +188,73 @@ class WindowsSnapshotTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 6)
 
     def test_readonly_sandbox_checks_without_installing(self):
-        with patch.object(Path, "mkdir", side_effect=PermissionError):
+        real_mkdir = Path.mkdir
+
+        def readonly_install(path, *args, **kwargs):
+            if path.parent == self.root.parent.parent:
+                raise PermissionError
+            return real_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", readonly_install):
             self.assertEqual(updater.update(self.root), "needs-write")
             self.assertTrue((self.root / "obsolete.txt").is_file())
         self.assertEqual(updater.update(self.root), "updated")
-        with patch.object(Path, "mkdir", side_effect=PermissionError):
+        with patch.object(Path, "mkdir", readonly_install):
             self.assertEqual(updater.update(self.root), "current")
             self.remote.rename(self.remote.with_name("unavailable"))
             self.assertEqual(updater.update(self.root), "offline")
+
+    def test_auto_installs_newer_gitee_when_github_is_behind(self):
+        self.prepare_bridge()
+        self.assertEqual(updater.update(self.root, preference="gitee"), "updated")
+        self.git("pull", "--ff-only", self.github.as_uri(), "main")
+        (self.remote / "gitee-first.md").write_text("new release")
+        self.commit()
+        self.assertEqual(updater.update(self.root, preference="github"), "updated")
+        self.assertFalse((self.root / "gitee-first.md").exists())
+        self.assertEqual(updater.update(self.root), "updated")
+        self.assertTrue((self.root / "gitee-first.md").is_file())
+        self.assertEqual(updater.update(self.root, preference="github"), "retained")
+        self.assertEqual(updater.update(self.root, preference="gitee"), "current")
+
+    def test_fallback_if_only_github_download_fails(self):
+        source = updater.read_source(self.root)
+        original = updater.remote_git
+        downloads = []
+
+        def interrupted(*args, **kwargs):
+            if args[0] == "fetch":
+                downloads.append(args[-2])
+                if args[-2] == source.github:
+                    raise updater.RemoteUnavailable()
+            return original(*args, **kwargs)
+
+        with patch.object(updater, "remote_git", side_effect=interrupted):
+            self.assertEqual(updater.update(self.root), "updated")
+        self.assertEqual(downloads, [source.github, source.legacy])
+        self.assert_updated()
+
+    def test_forked_mirrors_keep_installed_release(self):
+        self.prepare_bridge()
+        self.assertEqual(updater.update(self.root, preference="gitee"), "updated")
+        (self.remote / "gitee-fork.md").write_text("independent")
+        self.commit()
+        self.assertEqual(updater.update(self.root), "retained")
+        self.assertEqual((self.root / updater.REVISION).read_text().strip(), self.bridge)
+
+    def test_newer_advertised_head_cannot_be_downloaded(self):
+        self.prepare_bridge()
+        self.assertEqual(updater.update(self.root, preference="gitee"), "updated")
+        original = updater.remote_git
+
+        def unavailable(*args, **kwargs):
+            if args[0] == "fetch" and args[-2] == self.github_url:
+                raise updater.RemoteUnavailable()
+            return original(*args, **kwargs)
+
+        with patch.object(updater, "remote_git", side_effect=unavailable):
+            self.assertEqual(updater.update(self.root), "retained")
+        self.assertEqual((self.root / updater.REVISION).read_text().strip(), self.bridge)
 
     @unittest.skipIf(os.name == "nt", "uses POSIX snapshot exchange")
     def test_concurrent_snapshot_check_returns_immediately(self):

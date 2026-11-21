@@ -1,5 +1,6 @@
 """Check the release branch and update the installed skill in place."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import errno
 import io
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from typing import NamedTuple, Optional
 
 NAME = "seedance25-prompt-design-v1-0"
@@ -59,7 +61,7 @@ def remote_git(*args, cwd=None, timeout):
     # helper after the top-level Git process times out (notably on Windows).
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
     command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "http.lowSpeedLimit=1",
-               "-c", "http.lowSpeedTime=" + str(timeout), *args]
+               "-c", "http.lowSpeedTime=" + str(max(1, int(timeout))), *args]
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         with subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                               stdout=out, stderr=err, start_new_session=os.name != "nt") as proc:
@@ -81,8 +83,6 @@ def remote_git(*args, cwd=None, timeout):
                 proc.kill()
                 raise RemoteUnavailable from error
         if proc.returncode:
-            if args[0] == "ls-remote" and proc.returncode == 2:
-                raise ValueError("远端缺少技能配置的分支")
             raise RemoteUnavailable
         out.seek(0)
         return out.read()
@@ -274,7 +274,7 @@ def repository_path(url):
     return re.sub(r"\.git$", "", url)
 
 
-def update_checkout(root, source, revision):
+def checkout_revision(root, source):
     origin = git("config", "--get", "remote.origin.url", cwd=root).decode().strip()
     if repository_path(origin) not in {repository_path(source.legacy), repository_path(source.primary)}:
         raise ValueError("安装副本的 origin 与技能更新源不一致")
@@ -283,24 +283,10 @@ def update_checkout(root, source, revision):
         raise ValueError("请从技能配置的分支更新此安装副本")
     if git("status", "--porcelain", "--untracked-files=normal", cwd=root):
         raise ValueError("安装副本有本地改动，请先处理这些改动再更新")
-    head = git("rev-parse", "HEAD", cwd=root).decode().strip()
-    if head == revision:
-        return "current"
-    remote_git("fetch", "--quiet", "--no-tags", source.primary, source.ref, cwd=root, timeout=FETCH_SECONDS)
-    fetched = git("rev-parse", "--verify", "FETCH_HEAD^{commit}", cwd=root).decode().strip()
-    try:
-        git("merge-base", "--is-ancestor", head, fetched, cwd=root)
-    except subprocess.CalledProcessError as error:
-        if error.returncode == 1:
-            raise ValueError("安装副本有独立提交，无法快进到远端版本") from error
-        raise
-    if not source.accepts(parse_source(git("show", fetched + ":" + SOURCE, cwd=root))):
-        raise ValueError("更新包的来源与当前配置不一致")
-    git("merge", "--ff-only", "--no-overwrite-ignore", fetched, cwd=root)
-    return "updated"
+    return git("rev-parse", "HEAD", cwd=root).decode().strip()
 
 
-def update(root, bootstrap=None):
+def update(root, bootstrap=None, preference="auto"):
     checkout = (root / ".git").exists()
     if root.name != NAME or (checkout and (root.parent.name != "skills" or not (root / ".git").is_dir())):
         raise ValueError("请从此技能的安装目录执行更新")
@@ -318,16 +304,12 @@ def update(root, bootstrap=None):
             raise
         verify_skill(root)
         source = configured_source(root, bootstrap)
-        try:
-            available = remote_revision(source)
-        except RemoteUnavailable:
-            return "offline"
-        if checkout:
-            installed = git("rev-parse", "HEAD", cwd=root).decode().strip()
-        else:
-            marker = root / REVISION
-            installed = marker.read_text(encoding="ascii").strip() if marker.exists() else None
-        return "current" if installed == available else "needs-write"
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                return sync_release(root, source, checkout, False, Path(tmp) / "work", pending,
+                                    preference, readonly=True)
+            except RemoteUnavailable:
+                return "offline"
     with lock:
         try:
             lock_update(lock)
@@ -345,39 +327,109 @@ def update(root, bootstrap=None):
             discard(work)
         source = configured_source(root, bootstrap)
         try:
-            return sync_release(root, source, checkout, resumed, work, pending)
+            return sync_release(root, source, checkout, resumed, work, pending, preference)
         except RemoteUnavailable:
             verify_skill(root)
             return "updated-offline" if resumed else "offline"
 
 
-def remote_revision(source):
-    line = remote_git("ls-remote", "--exit-code", "--refs", source.primary, source.ref,
-                      timeout=PROBE_SECONDS).decode().strip()
+def remote_revision(url, ref):
+    try:
+        line = remote_git("ls-remote", "--exit-code", "--refs", url, ref,
+                          timeout=PROBE_SECONDS).decode().strip()
+    except RemoteUnavailable:
+        return None
     revision, actual_ref = line.split("\t")
-    if actual_ref != source.ref or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+    if actual_ref != ref or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
         raise ValueError("远端分支返回了无效的提交标识")
     return revision
 
 
-def sync_release(root, source, checkout, resumed, work, pending):
-    revision = remote_revision(source)
-    if checkout:
-        return update_checkout(root, source, revision)
+def release_heads(source, preference):
+    if preference not in ("auto", "github", "gitee"):
+        raise ValueError("更新源须为 auto、github 或 gitee")
+    if preference == "github" and not source.github:
+        raise ValueError("此旧版尚未配置 GitHub，请先经 Gitee 或新版更新器升级")
+    urls = [url for name, url in (("github", source.github), ("gitee", source.legacy))
+            if url and preference in ("auto", name)]
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        results = [(url, pool.submit(remote_revision, url, source.ref)) for url in urls]
+        heads = [(url, job.result()) for url, job in results]
+    available = [(url, rev) for url, rev in heads if rev]
+    if not available:
+        raise RemoteUnavailable
+    return available
+
+
+def is_ancestor(repo, older, newer):
+    try:
+        git("merge-base", "--is-ancestor", older, newer, cwd=repo)
+        return True
+    except subprocess.CalledProcessError as error:
+        if error.returncode in (1, 128):  # not an ancestor, or unknown locally
+            return False
+        raise
+
+
+def fetch_release(repo, heads, ref):
+    # Fetch the small release history so ZIP installs can prove fast-forward
+    # even when the other mirror is offline. Both fetches share one deadline.
+    deadline = time.monotonic() + FETCH_SECONDS
+    tips = []
+    for index, (url, advertised) in enumerate(heads):
+        if advertised in tips:
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            remote_git("fetch", "--quiet", "--no-tags", url, ref, cwd=repo,
+                       timeout=remaining / (len(heads) - index))
+        except RemoteUnavailable:
+            continue
+        tips.append(git("rev-parse", "--verify", "FETCH_HEAD^{commit}", cwd=repo).decode().strip())
+    if not tips:
+        raise RemoteUnavailable
+    for candidate in tips:
+        if all(is_ancestor(repo, other, candidate) for other in tips):
+            return candidate
+    return None  # independently advanced mirrors; keep the local installation
+
+
+def sync_release(root, source, checkout, resumed, work, pending, preference, readonly=False):
+    heads = release_heads(source, preference)
     marker = root / REVISION
-    if marker.exists() and marker.read_text(encoding="ascii").strip() == revision:
+    if checkout:
+        installed = checkout_revision(root, source)
+    else:
+        installed = marker.read_text(encoding="ascii").strip() if marker.is_file() else None
+    if installed and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", installed):
+        raise ValueError("安装副本的提交标识无效")
+    if all(rev == installed for _, rev in heads):
         return "updated" if resumed else "current"
     work.mkdir(mode=0o700)
     try:
         repo = work / "repo"
         git("init", "--bare", "--quiet", str(repo))
-        remote_git("fetch", "--quiet", "--depth=1", "--no-tags", source.primary, source.ref,
-                   cwd=repo, timeout=FETCH_SECONDS)
-        fetched = git("rev-parse", "--verify", "FETCH_HEAD^{commit}", cwd=repo).decode().strip()
+        fetched = fetch_release(repo, heads, source.ref)
+        if fetched == installed and fetched:
+            if any(not is_ancestor(repo, rev, fetched) for _, rev in heads):
+                verify_skill(root)
+                return "updated" if resumed else "retained"
+            return "updated" if resumed else "current"
+        if not fetched or (installed and not is_ancestor(repo, installed, fetched)):
+            verify_skill(root)
+            return "updated" if resumed else "retained"
+        if readonly:
+            return "needs-write"
         staged = work / "next"
         export_skill(repo, fetched, source.subdir, staged)
         if not source.accepts(read_source(staged)):
             raise ValueError("更新包的来源与当前配置不一致")
+        if checkout:
+            git("fetch", "--quiet", "--no-tags", str(repo), fetched, cwd=root)
+            git("merge", "--ff-only", "--no-overwrite-ignore", fetched, cwd=root)
+            return "updated"
         (staged / REVISION).write_text(fetched + "\n", encoding="ascii")
         if sys.platform == "win32":
             staged.rename(pending)
@@ -393,9 +445,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--install-dir", type=Path, default=Path(__file__).resolve().parents[1],
                         help="已有技能安装目录，可用新版更新器引导旧版完成首次升级")
+    parser.add_argument("--source", choices=("auto", "github", "gitee"),
+                        default=os.environ.get("SEEDANCE25_UPDATE_SOURCE", "auto"), help="本次更新源，默认自动")
     args = parser.parse_args()
     try:
-        print(update(args.install_dir.resolve(strict=True), Path(__file__).resolve().parents[1]))
+        print(update(args.install_dir.resolve(strict=True), Path(__file__).resolve().parents[1], args.source))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as error:
         if isinstance(error, subprocess.CalledProcessError):
             message = f"Git 命令 {error.cmd[3]} 失败，退出码 {error.returncode}，请检查网络、分支与仓库访问权限"
