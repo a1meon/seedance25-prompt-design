@@ -66,12 +66,45 @@ def separated(text):
     return re.split(r"(?m)^[ \t]*---[ \t]*\r?$", text)
 
 
+def check_prompt_format(text, errors, reviews):
+    # Ignore quoted speech and literal on-screen text when checking authoring instructions.
+    prose = SPOKEN.sub("", text)
+    lines = [line.strip() for line in prose.splitlines() if line.strip()]
+    if not any(line.startswith(("【生成目标】", "【参考素材职责】", "【事件脚本】", "【保持一致】", "【约束】"))
+               for line in lines):
+        return  # Existing callers can also submit just the shot text.
+    lines.append("")  # An empty final section has no following content.
+    suffix = "无bgm，无字幕。"
+    goal = ""
+    if lines[0].startswith("【生成目标】"):
+        goal = lines[0][len("【生成目标】"):].strip() or lines[1]
+    if not goal.endswith(suffix) or not goal[:-len(suffix)].strip() or goal.startswith("【"):
+        errors.append("把“无bgm，无字幕。”接在【生成目标】的正文句末，同一行写完。")
+    if len(re.findall(r"无\s*bgm\s*[,，、]\s*无字幕", prose, re.I)) > 1:
+        errors.append("每个提交段只在生成目标写一次声音与字幕要求。")
+    if any(line.startswith("【约束】") for line in lines):
+        errors.append("清理旧约束栏；有承接依据的内容才移入【保持一致】。")
+    for i, line in enumerate(lines):
+        if line.startswith("【保持一致】"):
+            content = line[len("【保持一致】"):].strip() or lines[i+1]
+            if not content or content.startswith("【") or content.rstrip("。.") in ("无", "无须", "保持一致"):
+                errors.append("没有具体承接内容时省去【保持一致】整栏。")
+            elif re.fullmatch(r"(?:保持|确保)?(?:(?:人物身份|人物数量|角色|人物|服装|场景|道具|站位|光线|画质)[、，和与及 ]*)+"
+                              r"(?:均|始终|前后)?(?:保持)?(?:一致|稳定|连续)[。.]?", content):
+                reviews.append("保持项只列了类别。核对本段究竟要承接哪个对象的什么状态，缺少依据就删去。")
+    if re.search(r"(?:无|没有|不(?:得|要)?(?:出现|新增|添加))\s*(?:其他|其它|额外|多余)(?:的)?(?:人物|人员|人|角色|道具|物品)", prose):
+        reviews.append("核对排除项的剧本或素材依据。如果已写清入镜内容，删去这项。")
+
+
 def prompt_parts(text):
     shots, reference_lines, outside = [], [], []
     section, current, numbered = "", None, False
     for line in text.splitlines():
         line = line.strip()
         if not line:
+            continue
+        if section == "保持一致" and not SECTION.match(line):
+            outside.append(line)
             continue
         if SHOT.match(line):
             section, numbered = "镜头", True
@@ -100,6 +133,7 @@ def prompt_parts(text):
 def inspect(text, prompt=False, expected=None, allowed_fixed=()):
     errors, reviews = [], []
     if prompt:
+        check_prompt_format(text, errors, reviews)
         shots, bindings, outside = prompt_parts(text)
         seen = set()
         for line in bindings:
